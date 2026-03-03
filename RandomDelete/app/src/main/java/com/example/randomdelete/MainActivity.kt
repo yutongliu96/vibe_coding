@@ -14,7 +14,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -105,7 +104,8 @@ private enum class ScreenState {
     Splash,
     Start,
     Swiping,
-    Review
+    Review,
+    AllMemories
 }
 
 @Composable
@@ -169,12 +169,8 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
         }
     }
 
-    Crossfade(
-        targetState = screenState,
-        modifier = modifier.fillMaxSize(),
-        label = "screen"
-    ) { state ->
-        when (state) {
+    Box(modifier = modifier.fillMaxSize()) {
+        when (screenState) {
             ScreenState.Splash -> {
                 SplashScreen()
             }
@@ -234,7 +230,12 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                             if (currentIndex < swipePhotos.lastIndex) {
                                 currentIndex += 1
                             } else {
-                                screenState = ScreenState.Review
+                                // 最后一张滑动结束后，根据是否有要删除的图片决定去哪个页面
+                                screenState = if (isDelete || deleteCandidates.isNotEmpty()) {
+                                    ScreenState.Review
+                                } else {
+                                    ScreenState.AllMemories
+                                }
                             }
                         },
                         onBackToStart = {
@@ -245,32 +246,32 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
             }
 
             ScreenState.Review -> {
-                if (deleteCandidates.isEmpty()) {
-                    // 本轮没有任何要删除的图片，弹出“都是美好的记忆！”的全屏提示
-                    AllBeautifulMemoriesScreen(
-                        onBackToStart = {
-                            screenState = ScreenState.Start
-                            deleteCandidates.clear()
-                            swipePhotos = emptyList()
-                            allPhotos = emptyList()
-                            currentIndex = 0
-                            errorMessage = null
-                        }
-                    )
-                } else {
-                    ReviewScreen(
-                        candidates = deleteCandidates,
-                        onDeleteFinished = {
-                            // 删除完成后回到 Start
-                            screenState = ScreenState.Start
-                            deleteCandidates.clear()
-                            swipePhotos = emptyList()
-                            allPhotos = emptyList()
-                            currentIndex = 0
-                            errorMessage = null
-                        }
-                    )
-                }
+                ReviewScreen(
+                    candidates = deleteCandidates,
+                    onDeleteFinished = {
+                        // 删除完成后回到 Start
+                        screenState = ScreenState.Start
+                        deleteCandidates.clear()
+                        swipePhotos = emptyList()
+                        allPhotos = emptyList()
+                        currentIndex = 0
+                        errorMessage = null
+                    }
+                )
+            }
+
+            ScreenState.AllMemories -> {
+                // 本轮没有任何要删除的图片，弹出“都是美好的记忆！”的全屏提示
+                AllBeautifulMemoriesScreen(
+                    onBackToStart = {
+                        screenState = ScreenState.Start
+                        deleteCandidates.clear()
+                        swipePhotos = emptyList()
+                        allPhotos = emptyList()
+                        currentIndex = 0
+                        errorMessage = null
+                    }
+                )
             }
         }
     }
@@ -518,18 +519,34 @@ private fun SwipeScreen(
             val hasNext = currentIndex < photos.lastIndex
             val nextPhoto = if (hasNext) photos[currentIndex + 1] else null
 
-            // 读取当前图片的拍摄地点（如果有）
+            // 读取当前图片的拍摄地点和更精确的拍摄时间（如果有 EXIF 或文件名中带时间）
             val context = LocalContext.current
             var locationText by remember(photo.uri) { mutableStateOf<String?>(null) }
+            var displayTimeMillis by remember(photo.uri) { mutableStateOf<Long?>(photo.dateTaken) }
+            var timeLabel by remember(photo.uri) { mutableStateOf("时间") }
 
             LaunchedEffect(photo.uri) {
-                locationText = withContext(Dispatchers.IO) {
+                val (timeFromExif, locationFromExif) = withContext(Dispatchers.IO) {
                     runCatching {
                         context.contentResolver.openInputStream(photo.uri)?.use { input ->
                             val exif = ExifInterface(input)
+
+                            // 1. 拍摄时间（优先 EXIF）
+                            val exifTimeString =
+                                exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                                    ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+                            val timeMillis = exifTimeString?.let { dt ->
+                                try {
+                                    val fmt = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
+                                    fmt.parse(dt)?.time
+                                } catch (e: Exception) {
+                                    null
+                                }
+                            }
+
+                            // 2. 拍摄地点（城市 + 国家）
                             val latLong = FloatArray(2)
-                            if (exif.getLatLong(latLong)) {
-                                // 通过逆地理编码把经纬度转换成「城市 + 国家」
+                            val location = if (exif.getLatLong(latLong)) {
                                 val geocoder = Geocoder(context, Locale.getDefault())
                                 val addresses = geocoder.getFromLocation(
                                     latLong[0].toDouble(),
@@ -554,9 +571,74 @@ private fun SwipeScreen(
                             } else {
                                 null
                             }
+
+                            Pair(timeMillis, location)
                         }
-                    }.getOrNull()
+                    }.getOrNull() ?: Pair(null, null)
                 }
+
+                // 若 EXIF 有“合理”的时间，则覆盖 MediaStore 的时间；
+                // 否则对 web 下载/拷贝类图片，继续使用导入时间（MediaStore 的时间）
+                if (timeFromExif != null) {
+                    val now = System.currentTimeMillis()
+                    // 1990-01-01 作为一个大致的下限，过滤掉 1970 年等无效时间
+                    val lowerBound = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                        .parse("1990-01-01")?.time ?: 0L
+                    val upperBound = now + 7L * 24 * 60 * 60 * 1000 // 稍微允许比当前时间晚一点
+                    if (timeFromExif in lowerBound..upperBound) {
+                        displayTimeMillis = timeFromExif
+                        timeLabel = "拍摄时间"
+                    }
+                }
+
+                // 2. 如果 EXIF 没有可靠时间，再尝试从文件名中解析时间（例如 20201231_235959.jpg）
+                if (timeFromExif == null || timeLabel != "拍摄时间") {
+                    val name = photo.uri.lastPathSegment ?: ""
+                    val nameTime = runCatching {
+                        // 从文件名中提取连续的数字片段，尝试常见日期格式
+                        val candidates = listOf(
+                            "yyyyMMdd_HHmmss",
+                            "yyyyMMddHHmmss",
+                            "yyyy-MM-dd_HH-mm-ss",
+                            "yyyy-MM-dd HH-mm-ss",
+                            "yyyy-MM-dd HH.mm.ss",
+                            "yyyy_MM_dd_HH_mm_ss",
+                            "yyyyMMdd"
+                        )
+                        val firstDigits = Regex("(\\d{8,14})").find(name)?.value
+                        if (firstDigits != null) {
+                            for (pattern in candidates) {
+                                try {
+                                    val fmt = SimpleDateFormat(pattern, Locale.US)
+                                    fmt.isLenient = false
+                                    val parsed = fmt.parse(firstDigits) ?: continue
+                                    return@runCatching parsed.time
+                                } catch (_: Exception) {
+                                    // 尝试下一个 pattern
+                                }
+                            }
+                        }
+                        null
+                    }.getOrNull()
+
+                    if (nameTime != null) {
+                        val now = System.currentTimeMillis()
+                        val lowerBound = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                            .parse("1990-01-01")?.time ?: 0L
+                        val upperBound = now + 7L * 24 * 60 * 60 * 1000
+                        if (nameTime in lowerBound..upperBound) {
+                            displayTimeMillis = nameTime
+                            timeLabel = "拍摄时间"
+                        }
+                    }
+                }
+
+                // 若既没有 EXIF、也没从文件名中解析出时间，但 MediaStore 有时间，则认为是导入时间
+                if (displayTimeMillis != null && timeLabel != "拍摄时间") {
+                    timeLabel = "导入时间"
+                }
+
+                locationText = locationFromExif
             }
 
             Box(
@@ -656,17 +738,23 @@ private fun SwipeScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            val dateText = remember(photo.dateTaken) {
-                photo.dateTaken?.let {
+            val dateText = remember(displayTimeMillis) {
+                displayTimeMillis?.let {
                     val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
                     fmt.format(Date(it))
                 } ?: "无时间信息"
             }
 
+            val prefix = when (timeLabel) {
+                "拍摄时间" -> "拍摄时间"
+                "导入时间" -> "导入时间"
+                else -> "时间"
+            }
+
             val infoText = if (locationText != null) {
-                "拍摄时间：$dateText   拍摄地点：${locationText}"
+                "$prefix：$dateText   拍摄地点：${locationText}"
             } else {
-                "拍摄时间：$dateText"
+                "$prefix：$dateText"
             }
 
             Text(
@@ -901,11 +989,12 @@ private suspend fun loadRandomPhotos(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI
                 }
 
-            // 同时读取 DATE_TAKEN 和 DATE_ADDED，避免时间为 0 时显示 1970 年
+            // 同时读取 DATE_TAKEN / DATE_ADDED / DATE_MODIFIED，综合判断时间
             val projection = arrayOf(
                 MediaStore.Images.Media._ID,
                 MediaStore.Images.Media.DATE_TAKEN,
-                MediaStore.Images.Media.DATE_ADDED
+                MediaStore.Images.Media.DATE_ADDED,
+                MediaStore.Images.Media.DATE_MODIFIED
             )
 
             context.contentResolver.query(
@@ -920,14 +1009,18 @@ private suspend fun loadRandomPhotos(
                     cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
                 val dateAddedColumn =
                     cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+                val dateModifiedColumn =
+                    cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idColumn)
-                    val rawTaken = cursor.getLong(dateTakenColumn)
-                    val rawAdded = cursor.getLong(dateAddedColumn) // 秒为单位
+                    val rawTaken = cursor.getLong(dateTakenColumn)        // 毫秒或 0
+                    val rawAdded = cursor.getLong(dateAddedColumn)        // 秒或 0
+                    val rawModified = cursor.getLong(dateModifiedColumn)  // 秒或 0
 
-                    // 优先使用拍摄时间；若为 0 或无效，则退回到添加时间
+                    // 优先级：拍摄时间 > 修改时间 > 添加时间
                     val timeMillis: Long? = when {
                         rawTaken > 0L -> rawTaken
+                        rawModified > 0L -> rawModified * 1000L
                         rawAdded > 0L -> rawAdded * 1000L
                         else -> null
                     }
