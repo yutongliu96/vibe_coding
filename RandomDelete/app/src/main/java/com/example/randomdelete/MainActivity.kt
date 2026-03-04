@@ -488,7 +488,7 @@ private fun StartScreen(
             val scrollState = rememberScrollableState { deltaPx ->
                 // scrollable 的 delta 是“内容移动”距离，这里向上滑时 delta 为负
                 val deltaItems = deltaPx / itemHeightPx
-                wheelOffset += -deltaItems
+                wheelOffset += deltaItems
 
                 // 每跨过 0.5 个 item，就切换一次数字并重置偏移，形成循环滚动
                 while (wheelOffset <= -0.5f) {
