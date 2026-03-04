@@ -22,6 +22,10 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.ScrollableDefaults
+import androidx.compose.foundation.gestures.scrollable
+import androidx.compose.foundation.gestures.rememberScrollableState
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -63,7 +67,10 @@ import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
@@ -125,6 +132,9 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
     var currentIndex by remember { mutableStateOf(0) }
     val deleteCandidates = remember { mutableStateListOf<PhotoItem>() }
 
+    // 本轮计划浏览的图片数量，默认 10，最大 30
+    var desiredCount by remember { mutableStateOf(10) }
+
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
 
@@ -158,7 +168,8 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                             screenState = ScreenState.Start
                         } else {
                             val shuffled = list.shuffled(Random(System.currentTimeMillis()))
-                            swipePhotos = shuffled.take(min(10, shuffled.size))
+                            val count = desiredCount.coerceIn(10, 30)
+                            swipePhotos = shuffled.take(min(count, shuffled.size))
                             deleteCandidates.clear()
                             currentIndex = 0
                             screenState = ScreenState.Swiping
@@ -185,6 +196,10 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                 StartScreen(
                     isLoading = isLoading,
                     errorMessage = errorMessage,
+                    selectedCount = desiredCount,
+                    onCountChange = { newCount ->
+                        desiredCount = newCount.coerceIn(10, 30)
+                    },
                     onStartClick = {
                         // 如果已经有权限就直接加载，否则请求权限
                         if (context.checkSelfPermission(permission) ==
@@ -201,7 +216,8 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                                             errorMessage = "相册中没有找到图片。"
                                         } else {
                                             val shuffled = list.shuffled(Random(System.currentTimeMillis()))
-                                            swipePhotos = shuffled.take(min(10, shuffled.size))
+                                            val count = desiredCount.coerceIn(10, 30)
+                                            swipePhotos = shuffled.take(min(count, shuffled.size))
                                             deleteCandidates.clear()
                                             currentIndex = 0
                                             screenState = ScreenState.Swiping
@@ -300,12 +316,16 @@ private fun SplashScreen() {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            TrashCanSketch(
-                canvasSize = 160.dp,
-                modifier = Modifier.graphicsLayer {
-                    scaleX = scale
-                    scaleY = scale
-                }
+            Image(
+                painter = painterResource(id = R.drawable.baseline_monochrome_photos_24),
+                contentDescription = "app icon",
+                modifier = Modifier
+                    .size(160.dp)
+                    .graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                    },
+                contentScale = ContentScale.Fit
             )
             Spacer(modifier = Modifier.height(24.dp))
             Text(
@@ -420,6 +440,8 @@ private fun TrashCanSketch(
 private fun StartScreen(
     isLoading: Boolean,
     errorMessage: String?,
+    selectedCount: Int,
+    onCountChange: (Int) -> Unit,
     onStartClick: () -> Unit
 ) {
     Box(
@@ -433,8 +455,136 @@ private fun StartScreen(
                 .fillMaxWidth()
                 .padding(24.dp)
         ) {
-            TrashCanSketch(canvasSize = 120.dp)
-            Spacer(modifier = Modifier.height(32.dp))
+            Image(
+                painter = painterResource(id = R.drawable.baseline_monochrome_photos_24),
+                contentDescription = "app icon",
+                modifier = Modifier.size(120.dp),
+                contentScale = ContentScale.Fit
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // 这次要看几张图？ + 滚轮样式选择器（10～30，循环）
+            Text(
+                text = "这次要看几张图？",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            val minCount = 10
+            val maxCount = 30
+            fun inc(value: Int): Int = if (value >= maxCount) minCount else value + 1
+            fun dec(value: Int): Int = if (value <= minCount) maxCount else value - 1
+
+            val haptic = LocalHapticFeedback.current
+
+            // 每一行在屏幕上的高度，用于将像素位移换算成 item 偏移量
+            val density = LocalDensity.current
+            val itemHeightPx = with(density) { 36.dp.toPx() }
+
+            // 滚轮偏移（单位：item 高度），0 表示当前 selectedCount 在正中心
+            var wheelOffset by remember { mutableStateOf(0f) }
+
+            // 使用 scrollable 提供的惯性滚动行为
+            val scrollState = rememberScrollableState { deltaPx ->
+                // scrollable 的 delta 是“内容移动”距离，这里向上滑时 delta 为负
+                val deltaItems = deltaPx / itemHeightPx
+                wheelOffset += -deltaItems
+
+                // 每跨过 0.5 个 item，就切换一次数字并重置偏移，形成循环滚动
+                while (wheelOffset <= -0.5f) {
+                    val newValue = inc(selectedCount)
+                    onCountChange(newValue)
+                    wheelOffset += 1f
+                    haptic.performHapticFeedback(
+                        androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove
+                    )
+                }
+                while (wheelOffset >= 0.5f) {
+                    val newValue = dec(selectedCount)
+                    onCountChange(newValue)
+                    wheelOffset -= 1f
+                    haptic.performHapticFeedback(
+                        androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove
+                    )
+                }
+
+                // 告诉 scrollable 实际消费了多少像素
+                deltaPx
+            }
+
+            Box(
+                modifier = Modifier
+                    .width(160.dp)
+                    .border(
+                        width = 1.dp,
+                        color = Color.LightGray,
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .padding(vertical = 16.dp, horizontal = 12.dp)
+                    .scrollable(
+                        state = scrollState,
+                        orientation = Orientation.Vertical,
+                        flingBehavior = ScrollableDefaults.flingBehavior(),
+                        enabled = true
+                    )
+            ) {
+                // 显示多个可见项，形成 3D 滚轮效果
+                val visibleCount = 7 // 中间 + 上下各 3
+                val half = visibleCount / 2
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    for (i in -half..half) {
+                        val position = i.toFloat()
+                        // 当前项相对于中心的距离（加上滚轮偏移）
+                        val distanceFromCenter = position + wheelOffset
+                        val absDistance = kotlin.math.abs(distanceFromCenter)
+
+                        // 缩放 + 透明度 + 轻微 3D 旋转
+                        val scale = 1f - 0.12f * absDistance.coerceIn(0f, 3f)
+                        val alpha = 1f - 0.35f * absDistance.coerceIn(0f, 3f)
+                        val rotationX = 18f * distanceFromCenter
+
+                        // 以 selectedCount 为中心，向上/向下依次递增/递减，形成循环
+                        val value = when {
+                            i == 0 -> selectedCount
+                            i > 0 -> {
+                                var v = selectedCount
+                                repeat(i) { v = inc(v) }
+                                v
+                            }
+                            else -> {
+                                var v = selectedCount
+                                repeat(-i) { v = dec(v) }
+                                v
+                            }
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .height(32.dp)
+                                .fillMaxWidth(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = value.toString(),
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = if (i == 0) FontWeight.Bold else FontWeight.Normal,
+                                color = MaterialTheme.colorScheme.onBackground.copy(alpha = alpha),
+                                modifier = Modifier.graphicsLayer {
+                                    this.scaleX = scale
+                                    this.scaleY = scale
+                                    this.rotationX = rotationX
+                                    this.transformOrigin = TransformOrigin(0.5f, 0.5f)
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
             Button(
                 onClick = onStartClick,
                 enabled = !isLoading
