@@ -467,7 +467,8 @@ private fun SwipeScreen(
     // 每一张图片都有自己独立的偏移量状态，切换到下一张时自动重置为 0，避免抖动
     var offsetY by remember(currentIndex) { mutableStateOf(0f) }
     var dragHeight by remember { mutableStateOf(1f) }
-    var isMuted by remember { mutableStateOf(false) }
+    // 默认静音
+    var isMuted by remember { mutableStateOf(true) }
     val view = LocalView.current
     val toneGenerator = remember { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }
 
