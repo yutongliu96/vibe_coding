@@ -39,6 +39,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -61,6 +63,7 @@ import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
@@ -70,6 +73,9 @@ import coil.compose.AsyncImage
 import androidx.exifinterface.media.ExifInterface
 import android.location.Geocoder
 import com.example.randomdelete.ui.theme.RandomDeleteTheme
+import android.view.SoundEffectConstants
+import android.media.AudioManager
+import android.media.ToneGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -448,7 +454,7 @@ private fun StartScreen(
 }
 
 /**
- * 10 张卡片左右滑动：左滑 = 删除候选，右滑 = 保留
+ * 10 张卡片上下滑动：上滑 = 保留，下滑 = 删除候选
  */
 @Composable
 private fun SwipeScreen(
@@ -458,39 +464,33 @@ private fun SwipeScreen(
     onDecide: (delete: Boolean) -> Unit,
     onBackToStart: () -> Unit
 ) {
-    var offsetX by remember { mutableStateOf(0f) }
-    var dragWidth by remember { mutableStateOf(1f) }
+    // 每一张图片都有自己独立的偏移量状态，切换到下一张时自动重置为 0，避免抖动
+    var offsetY by remember(currentIndex) { mutableStateOf(0f) }
+    var dragHeight by remember { mutableStateOf(1f) }
+    var isMuted by remember { mutableStateOf(false) }
+    val view = LocalView.current
+    val toneGenerator = remember { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }
 
     // 根据拖动距离计算透明度（越远越淡，最低约 30% 透明）
-    val alpha = remember(offsetX, dragWidth) {
-        val maxOffset = dragWidth / 2f
+    val alpha = remember(offsetY, dragHeight) {
+        val maxOffset = dragHeight / 2f
         val progress = if (maxOffset > 0f) {
-            (kotlin.math.abs(offsetX) / maxOffset).coerceIn(0f, 1f)
+            (kotlin.math.abs(offsetY) / maxOffset).coerceIn(0f, 1f)
         } else {
             0f
         }
         1f - 0.7f * progress
     }
 
-    val nextAlpha = remember(offsetX, dragWidth) {
-        val maxOffset = dragWidth / 2f
+    val nextAlpha = remember(offsetY, dragHeight) {
+        val maxOffset = dragHeight / 2f
         val progress = if (maxOffset > 0f) {
-            (kotlin.math.abs(offsetX) / maxOffset).coerceIn(0f, 1f)
+            (kotlin.math.abs(offsetY) / maxOffset).coerceIn(0f, 1f)
         } else {
             0f
         }
         // 下一张从 0 到最多 0.9 的透明度
         0.9f * progress
-    }
-
-    // 判定一次滑动是否成功的最小位移（屏幕宽度的三分之一）
-    fun isSwipeAccepted(): Boolean {
-        val threshold = dragWidth / 3f
-        return kotlin.math.abs(offsetX) >= threshold
-    }
-
-    fun reset() {
-        offsetX = 0f
     }
 
     Box(
@@ -503,6 +503,20 @@ private fun SwipeScreen(
                 .fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            // 右上角静音按钮（喇叭形状，用文本符号表示）
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = { isMuted = !isMuted }) {
+                    Text(
+                        text = if (isMuted) "🔇" else "🔈"
+                    )
+                }
+            }
+
             Text(
                 text = "第 ${currentIndex + 1} / ${photos.size} 张",
                 style = MaterialTheme.typography.titleMedium
@@ -512,7 +526,6 @@ private fun SwipeScreen(
                 text = "预备删除：$deleteCount 张",
                 style = MaterialTheme.typography.bodyMedium
             )
-
             Spacer(modifier = Modifier.height(16.dp))
 
             val photo = photos[currentIndex]
@@ -671,12 +684,12 @@ private fun SwipeScreen(
                     }
                 }
 
-                // 当前图片：左右平移 + 透明度变化
+                // 当前图片：上下平移 + 透明度变化
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer {
-                            translationX = offsetX
+                            translationY = offsetY
                             this.alpha = alpha
                         }
                         .border(
@@ -684,31 +697,52 @@ private fun SwipeScreen(
                             color = Color.LightGray,
                             shape = RoundedCornerShape(16.dp)
                         )
-                        .pointerInput(Unit) {
+                        .pointerInput(photo.uri) {
+                            // 上下滑判定：距离阈值，不再依赖速度，避免方向误判
                             detectDragGestures(
-                                onDragEnd = {
-                                    if (isSwipeAccepted()) {
-                                        // 根据方向决定删除或保留
-                                        val isDelete = offsetX < 0f
-                                        onDecide(isDelete)
-                                    }
-                                    reset()
+                                onDragStart = { _ ->
+                                    val heightPx = size.height.toFloat().coerceAtLeast(1f)
+                                    dragHeight = heightPx
                                 },
                                 onDragCancel = {
-                                    reset()
+                                    offsetY = 0f
+                                },
+                                onDragEnd = {
+                                    val heightPx = dragHeight.coerceAtLeast(1f)
+                                    // 降低触发阈值：大约 1/6 屏高，更接近短视频手感
+                                    val distanceThreshold = heightPx * 0.16f
+                                    val currentOffset = offsetY
+
+                                    if (kotlin.math.abs(currentOffset) < distanceThreshold) {
+                                        // 距离不够，回到中心
+                                        offsetY = 0f
+                                        return@detectDragGestures
+                                    }
+
+                                    // 只用位移方向判定，上滑=保留，下滑=删除，不会被小反向速度干扰
+                                    val isDelete = currentOffset > 0f // 下滑=删除
+                                    if (isDelete && !isMuted) {
+                                        // 使用 ToneGenerator 播放一声短促提示音，更可靠
+                                        toneGenerator.startTone(
+                                            ToneGenerator.TONE_PROP_ACK,
+                                            /* durationMs = */ 150
+                                        )
+                                    }
+                                    // 直接切换到下一张，并重置当前偏移，避免新图片抖动
+                                    offsetY = 0f
+                                    onDecide(isDelete)
                                 }
                             ) { change, dragAmount ->
                                 change.consume()
-                                val width = size.width.toFloat().coerceAtLeast(1f)
-                                dragWidth = width
-                                offsetX += dragAmount.x
+                                // 只跟随垂直位移（更接近短视频上下滑）
+                                offsetY += dragAmount.y
                             }
                         }
                         .pointerInput(photo.uri) {
                             // 不滑动状态下双击，使用系统相册/图片查看器打开这张图片
                             detectTapGestures(
                                 onDoubleTap = {
-                                    if (kotlin.math.abs(offsetX) < dragWidth / 10f) {
+                                    if (kotlin.math.abs(offsetY) < dragHeight / 10f) {
                                         val intent = Intent(Intent.ACTION_VIEW).apply {
                                             setDataAndType(photo.uri, "image/*")
                                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -773,7 +807,7 @@ private fun SwipeScreen(
                     Text("返回 Start")
                 }
                 Text(
-                    text = "左滑=删除  右滑=保留",
+                    text = "上滑=保留  下滑=删除",
                     style = MaterialTheme.typography.bodySmall,
                     textAlign = TextAlign.End
                 )
@@ -796,6 +830,8 @@ private fun ReviewScreen(
         mutableStateListOf<PhotoItem>().apply { addAll(candidates) }
     }
     var isDeleting by remember { mutableStateOf(false) }
+    val allSelected = selected.size == candidates.size && candidates.isNotEmpty()
+    var showGiveUp by remember { mutableStateOf(false) }
 
     // 用于 Android 10+ 调用系统删除确认弹窗
     val deleteLauncher = rememberLauncherForActivityResult(
@@ -806,130 +842,186 @@ private fun ReviewScreen(
         onDeleteFinished()
     }
 
-    Column(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp)
     ) {
-        Text(
-            text = "准备删除的图片（点击勾选/取消）：",
-            style = MaterialTheme.typography.titleMedium
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-
-        if (candidates.isEmpty()) {
-            Text(
-                text = "本轮没有选择删除任何图片。",
-                style = MaterialTheme.typography.bodyMedium
-            )
-        } else {
-            LazyColumn(
+        if (showGiveUp) {
+            // “想想还是算了吧” 页面，点击任意位置回到 Start
+            Box(
                 modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
+                    .fillMaxSize()
+                    .clickable {
+                        showGiveUp = false
+                        onDeleteFinished()
+                    },
+                contentAlignment = Alignment.Center
             ) {
-                items(candidates, key = { it.uri.toString() }) { photo ->
-                    val checked = selected.contains(photo)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 8.dp)
-                            .clickable {
-                                if (checked) selected.remove(photo) else selected.add(photo)
-                            },
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        AsyncImage(
-                            model = photo.uri,
-                            contentDescription = "candidate",
-                            modifier = Modifier
-                                .size(72.dp)
-                                .border(
-                                    width = 1.dp,
-                                    color = Color.LightGray,
-                                    shape = RoundedCornerShape(8.dp)
-                                ),
-                            contentScale = ContentScale.Crop
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Column(
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text(
-                                text = photo.uri.lastPathSegment ?: "图片",
-                                maxLines = 1
-                            )
-                        }
-                        Checkbox(
-                            checked = checked,
-                            onCheckedChange = {
-                                if (checked) selected.remove(photo) else selected.add(photo)
-                            }
-                        )
-                    }
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "想想还是算了吧",
+                        style = MaterialTheme.typography.headlineMedium,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = "轻触屏幕回到 Start。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center
+                    )
                 }
             }
-        }
+        } else {
+            Column(
+                modifier = Modifier.fillMaxSize()
+            ) {
+                Text(
+                    text = "准备删除的图片（点击勾选/取消）：",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Spacer(modifier = Modifier.height(8.dp))
 
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Button(
-            onClick = {
-                if (selected.isEmpty() || isDeleting) {
-                    onDeleteFinished()
-                    return@Button
-                }
-                isDeleting = true
-                val uris = selected.map { it.uri }
-
-                when {
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
-                        // Android 11+ 优先使用“回收站”能力，让图片进入系统/相册的“最近删除”
-                        val pi = MediaStore.createTrashRequest(
-                            context.contentResolver,
-                            uris,
-                            /* isTrashed = */ true
-                        )
-                        deleteLauncher.launch(
-                            androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
-                                .build()
-                        )
-                    }
-
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
-                        // Android 10 只有永久删除，没有官方“回收站”API
-                        val pi = MediaStore.createDeleteRequest(
-                            context.contentResolver,
-                            uris
-                        )
-                        deleteLauncher.launch(
-                            androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
-                                .build()
-                        )
-                    }
-
-                    else -> {
-                        // 更老的系统直接删除
-                        scope.launch {
-                            withContext(Dispatchers.IO) {
-                                selected.forEach { item ->
-                                    runCatching {
-                                        context.contentResolver.delete(item.uri, null, null)
-                                    }
-                                }
+                // 全选 / 取消全选 按钮
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = {
+                            if (allSelected) {
+                                selected.clear()
+                            } else {
+                                selected.clear()
+                                selected.addAll(candidates)
                             }
-                            isDeleting = false
-                            onDeleteFinished()
+                        }
+                    ) {
+                        Text(if (allSelected) "取消全选" else "全选")
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (candidates.isEmpty()) {
+                    Text(
+                        text = "本轮没有选择删除任何图片。",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                    ) {
+                        items(candidates, key = { it.uri.toString() }) { photo ->
+                            val checked = selected.contains(photo)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 8.dp)
+                                    .clickable {
+                                        if (checked) selected.remove(photo) else selected.add(photo)
+                                    },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AsyncImage(
+                                    model = photo.uri,
+                                    contentDescription = "candidate",
+                                    modifier = Modifier
+                                        .size(72.dp)
+                                        .border(
+                                            width = 1.dp,
+                                            color = Color.LightGray,
+                                            shape = RoundedCornerShape(8.dp)
+                                        ),
+                                    contentScale = ContentScale.Crop
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(
+                                        text = photo.uri.lastPathSegment ?: "图片",
+                                        maxLines = 1
+                                    )
+                                }
+                                Checkbox(
+                                    checked = checked,
+                                    onCheckedChange = {
+                                        if (checked) selected.remove(photo) else selected.add(photo)
+                                    }
+                                )
+                            }
                         }
                     }
                 }
-            },
-            enabled = !isDeleting,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(
-                text = if (isDeleting) "删除中..." else "Delete（共 ${selected.size} 张）"
-            )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Button(
+                    onClick = {
+                        if (isDeleting) return@Button
+                        if (selected.isEmpty()) {
+                            // 没有选择任何图片时，展示“想想还是算了吧”页面
+                            showGiveUp = true
+                            return@Button
+                        }
+                        isDeleting = true
+                        val uris = selected.map { it.uri }
+
+                        when {
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                                // Android 11+ 优先使用“回收站”能力，让图片进入系统/相册的“最近删除”
+                                val pi = MediaStore.createTrashRequest(
+                                    context.contentResolver,
+                                    uris,
+                                    /* isTrashed = */ true
+                                )
+                                deleteLauncher.launch(
+                                    androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
+                                        .build()
+                                )
+                            }
+
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                                // Android 10 只有永久删除，没有官方“回收站”API
+                                val pi = MediaStore.createDeleteRequest(
+                                    context.contentResolver,
+                                    uris
+                                )
+                                deleteLauncher.launch(
+                                    androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
+                                        .build()
+                                )
+                            }
+
+                            else -> {
+                                // 更老的系统直接删除
+                                scope.launch {
+                                    withContext(Dispatchers.IO) {
+                                        selected.forEach { item ->
+                                            runCatching {
+                                                context.contentResolver.delete(item.uri, null, null)
+                                            }
+                                        }
+                                    }
+                                    isDeleting = false
+                                    onDeleteFinished()
+                                }
+                            }
+                        }
+                    },
+                    enabled = !isDeleting,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = if (isDeleting) "删除中..." else "Delete（共 ${selected.size} 张）"
+                    )
+                }
+            }
         }
     }
 }
