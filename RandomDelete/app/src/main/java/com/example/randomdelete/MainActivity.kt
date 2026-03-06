@@ -3,6 +3,7 @@
 import android.Manifest
 import android.content.ContentUris
 import android.content.Context
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -339,7 +340,7 @@ private fun SplashScreen() {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Image(
-                painter = painterResource(id = R.drawable.baseline_monochrome_photos_24),
+                painter = painterResource(id = R.drawable.icon),
                 contentDescription = "app icon",
                 modifier = Modifier
                     .size(160.dp)
@@ -478,7 +479,7 @@ private fun StartScreen(
                 .padding(24.dp)
         ) {
             Image(
-                painter = painterResource(id = R.drawable.baseline_monochrome_photos_24),
+                painter = painterResource(id = R.drawable.icon),
                 contentDescription = "app icon",
                 modifier = Modifier.size(120.dp),
                 contentScale = ContentScale.Fit
@@ -1208,8 +1209,14 @@ private fun ReviewScreen(
                                 Column(
                                     modifier = Modifier.weight(1f)
                                 ) {
+                                    val reviewTimeText = remember(photo.dateTaken) {
+                                        photo.dateTaken?.let {
+                                            val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+                                            "时间：${fmt.format(Date(it))}"
+                                        } ?: "无时间信息"
+                                    }
                                     Text(
-                                        text = photo.uri.lastPathSegment ?: "图片",
+                                        text = reviewTimeText,
                                         maxLines = 1
                                     )
                                 }
@@ -1253,16 +1260,36 @@ private fun ReviewScreen(
 
                             when {
                                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
-                                    // Android 11+ 优先使用“回收站”能力，让图片进入系统/相册的“最近删除”
-                                    val pi = MediaStore.createTrashRequest(
-                                        context.contentResolver,
-                                        uris,
-                                        /* isTrashed = */ true
-                                    )
-                                    deleteLauncher.launch(
-                                        androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
-                                            .build()
-                                    )
+                                    // Android 11+:
+                                    // 1) 先尝试直接标记 IS_TRASHED=1（部分机型更稳定进入“最近删除”）
+                                    // 2) 对失败项再走系统确认的 TrashRequest
+                                    scope.launch {
+                                        val needUserConfirm = withContext(Dispatchers.IO) {
+                                            val values = ContentValues().apply {
+                                                put(MediaStore.MediaColumns.IS_TRASHED, 1)
+                                            }
+                                            uris.filter { uri ->
+                                                runCatching {
+                                                    context.contentResolver.update(uri, values, null, null) <= 0
+                                                }.getOrElse { true }
+                                            }
+                                        }
+
+                                        if (needUserConfirm.isEmpty()) {
+                                            isDeleting = false
+                                            onDeleteFinished()
+                                        } else {
+                                            val pi = MediaStore.createTrashRequest(
+                                                context.contentResolver,
+                                                needUserConfirm,
+                                                /* isTrashed = */ true
+                                            )
+                                            deleteLauncher.launch(
+                                                androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
+                                                    .build()
+                                            )
+                                        }
+                                    }
                                 }
 
                                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
@@ -1418,3 +1445,4 @@ private fun SplashPreview() {
         SplashScreen()
     }
 }
+
