@@ -1,6 +1,8 @@
 ﻿package com.example.randomdelete
 
 import android.Manifest
+import android.app.Activity
+import android.content.ClipData
 import android.content.ContentUris
 import android.content.Context
 import android.content.ContentValues
@@ -9,6 +11,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.media.AudioAttributes
+import android.media.SoundPool
 import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -50,6 +54,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -81,10 +86,9 @@ import coil.compose.AsyncImage
 import androidx.exifinterface.media.ExifInterface
 import android.location.Geocoder
 import com.example.randomdelete.ui.theme.RandomDeleteTheme
-import android.view.SoundEffectConstants
-import android.media.AudioManager
-import android.media.ToneGenerator
+import android.view.HapticFeedbackConstants
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -122,10 +126,16 @@ private enum class ScreenState {
     AllMemories
 }
 
+private const val APP_PREFS_NAME = "random_delete_prefs"
+private const val PREF_KEY_SWIPE_MUTED = "swipe_muted"
+
 @Composable
 private fun RandomDeleteApp(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val prefs = remember(context) {
+        context.getSharedPreferences(APP_PREFS_NAME, Context.MODE_PRIVATE)
+    }
 
     var screenState by remember { mutableStateOf(ScreenState.Splash) }
     var allPhotos by remember { mutableStateOf<List<PhotoItem>>(emptyList()) }
@@ -138,6 +148,8 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
 
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
+    // 默认非静音；用户切换后持久化，直到下次再次切换
+    var isSwipeMuted by remember { mutableStateOf(prefs.getBoolean(PREF_KEY_SWIPE_MUTED, false)) }
 
     // 启动时垃圾桶动画结束后进入 Start 页面
     LaunchedEffect(Unit) {
@@ -257,6 +269,11 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                         currentIndex = currentIndex,
                         deleteSet = deleteCandidates.toSet(),
                         deleteCount = deleteCandidates.size,
+                        isMuted = isSwipeMuted,
+                        onMutedChange = { muted ->
+                            isSwipeMuted = muted
+                            prefs.edit().putBoolean(PREF_KEY_SWIPE_MUTED, muted).apply()
+                        },
                         onDeleteCurrent = {
                             val current = swipePhotos[currentIndex]
                             if (!deleteCandidates.contains(current)) {
@@ -628,6 +645,41 @@ private fun StartScreen(
 
 private enum class DragAxis { Horizontal, Vertical }
 
+private class SwipeWhooshPlayer(context: Context) {
+    private val soundPool: SoundPool
+    private var soundId: Int = 0
+    private var loaded = false
+
+    init {
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        soundPool = SoundPool.Builder()
+            .setMaxStreams(2)
+            .setAudioAttributes(attrs)
+            .build()
+        soundPool.setOnLoadCompleteListener { _, sampleId, status ->
+            loaded = status == 0 && sampleId == soundId
+        }
+        soundId = soundPool.load(context, R.raw.flick_whoosh, 1)
+    }
+
+    fun play(isLeft: Boolean) {
+        if (!loaded || soundId == 0) return
+        val (leftVolume, rightVolume) = if (isLeft) {
+            1.0f to 0.72f
+        } else {
+            0.72f to 1.0f
+        }
+        soundPool.play(soundId, leftVolume, rightVolume, 1, 0, 1.0f)
+    }
+
+    fun release() {
+        soundPool.release()
+    }
+}
+
 /**
  * 浏览随机照片：
  * - 左/右滑：标记删除并进入下一张（最后一张则进入删除页）
@@ -640,20 +692,27 @@ private fun SwipeScreen(
     currentIndex: Int,
     deleteSet: Set<PhotoItem>,
     deleteCount: Int,
+    isMuted: Boolean,
+    onMutedChange: (Boolean) -> Unit,
     onDeleteCurrent: () -> Unit,
     onNext: () -> Unit,
     onPrev: () -> Unit,
     onBackToStart: () -> Unit
 ) {
+    val uiContext = LocalContext.current
     // 每张图片独立位移状态，切换时重置
     var offsetX by remember(currentIndex) { mutableStateOf(0f) }
     var offsetY by remember(currentIndex) { mutableStateOf(0f) }
     var dragWidth by remember { mutableStateOf(1f) }
     var dragHeight by remember { mutableStateOf(1f) }
-    // 默认静音
-    var isMuted by remember { mutableStateOf(true) }
+    var deleteThresholdHapticSent by remember(currentIndex) { mutableStateOf(false) }
+    var hideCurrentPhotoDuringExit by remember(currentIndex) { mutableStateOf(false) }
     val view = LocalView.current
-    val toneGenerator = remember { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }
+    val whooshPlayer = remember { SwipeWhooshPlayer(uiContext) }
+    val swipeScope = rememberCoroutineScope()
+    DisposableEffect(Unit) {
+        onDispose { whooshPlayer.release() }
+    }
 
     val alpha = remember(offsetX, offsetY, dragWidth, dragHeight) {
         val maxX = dragWidth / 2f
@@ -699,7 +758,7 @@ private fun SwipeScreen(
                 horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = { isMuted = !isMuted }) {
+                IconButton(onClick = { onMutedChange(!isMuted) }) {
                     Text(
                         text = if (isMuted) "🔇" else "🔈"
                     )
@@ -718,8 +777,12 @@ private fun SwipeScreen(
             Spacer(modifier = Modifier.height(16.dp))
 
             val photo = photos[currentIndex]
-            val hasNext = currentIndex < photos.lastIndex
-            val nextPhoto = if (hasNext) photos[currentIndex + 1] else null
+            val nextIndex = ((currentIndex + 1)..photos.lastIndex).firstOrNull { idx ->
+                val item = photos[idx]
+                !deleteSet.contains(item)
+            }
+            val hasNext = nextIndex != null
+            val nextPhoto = nextIndex?.let { photos[it] }
             val prevIndex = (currentIndex - 1 downTo 0).firstOrNull { idx ->
                 val item = photos[idx]
                 !deleteSet.contains(item)
@@ -907,7 +970,7 @@ private fun SwipeScreen(
                         .graphicsLayer {
                             translationX = offsetX
                             translationY = offsetY
-                            this.alpha = alpha
+                            this.alpha = if (hideCurrentPhotoDuringExit) 0f else alpha
                         }
                         .border(
                             width = 1.dp,
@@ -923,11 +986,15 @@ private fun SwipeScreen(
                                     val widthPx = size.width.toFloat().coerceAtLeast(1f)
                                     dragHeight = heightPx
                                     dragWidth = widthPx
+                                    deleteThresholdHapticSent = false
+                                    hideCurrentPhotoDuringExit = false
                                     dragAxis = null
                                     offsetX = 0f
                                     offsetY = 0f
                                 },
                                 onDragCancel = {
+                                    deleteThresholdHapticSent = false
+                                    hideCurrentPhotoDuringExit = false
                                     offsetX = 0f
                                     offsetY = 0f
                                     dragAxis = null
@@ -943,9 +1010,11 @@ private fun SwipeScreen(
                                         null -> absX > absY
                                     }
                                     val primaryDist = if (horizontal) absX else absY
-                                    val threshold = (if (horizontal) widthPx else heightPx) * 0.16f
+                                    val threshold = (if (horizontal) widthPx else heightPx) * 0.20f
 
                                     if (primaryDist < threshold) {
+                                        deleteThresholdHapticSent = false
+                                        hideCurrentPhotoDuringExit = false
                                         offsetX = 0f
                                         offsetY = 0f
                                         dragAxis = null
@@ -953,18 +1022,34 @@ private fun SwipeScreen(
                                     }
 
                                     if (horizontal) {
-                                        if (!isMuted) {
-                                            toneGenerator.startTone(
-                                                ToneGenerator.TONE_PROP_ACK,
-                                                /* durationMs = */ 150
-                                            )
-                                        }
-                                        offsetX = 0f
-                                        offsetY = 0f
+                                        val deletingLastPhoto = !hasNext
+                                        val direction = if (offsetX < 0f) -1f else 1f
+                                        if (!isMuted) whooshPlayer.play(isLeft = offsetX < 0f)
+                                        deleteThresholdHapticSent = false
                                         dragAxis = null
-                                        onDeleteCurrent()
+                                        if (deletingLastPhoto) {
+                                            // 最后一张删除时：直接飞出并隐藏当前图，避免回弹停留。
+                                            hideCurrentPhotoDuringExit = true
+                                            offsetX = direction * dragWidth.coerceAtLeast(1f) * 1.25f
+                                            offsetY = 0f
+                                            if (!isMuted) {
+                                                swipeScope.launch {
+                                                    delay(170L)
+                                                    onDeleteCurrent()
+                                                }
+                                            } else {
+                                                onDeleteCurrent()
+                                            }
+                                        } else {
+                                            hideCurrentPhotoDuringExit = false
+                                            offsetX = 0f
+                                            offsetY = 0f
+                                            onDeleteCurrent()
+                                        }
                                     } else {
                                         val isDown = offsetY > 0f
+                                        deleteThresholdHapticSent = false
+                                        hideCurrentPhotoDuringExit = false
                                         offsetX = 0f
                                         offsetY = 0f
                                         dragAxis = null
@@ -980,6 +1065,12 @@ private fun SwipeScreen(
                                 if (dragAxis == DragAxis.Horizontal) {
                                     offsetX += dragAmount.x
                                     offsetY = 0f
+                                    val deleteThreshold = dragWidth.coerceAtLeast(1f) * 0.20f
+                                    if (!deleteThresholdHapticSent && kotlin.math.abs(offsetX) >= deleteThreshold) {
+                                        // 临界点：确认删除阈值被越过时，触发一次强反馈
+                                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                        deleteThresholdHapticSent = true
+                                    }
                                 } else {
                                     offsetY += dragAmount.y
                                     offsetX = 0f
@@ -994,11 +1085,7 @@ private fun SwipeScreen(
                                         kotlin.math.abs(offsetY) < dragHeight / 10f &&
                                         kotlin.math.abs(offsetX) < dragWidth / 10f
                                     ) {
-                                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                                            setDataAndType(photo.uri, "image/*")
-                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                        }
-                                        runCatching { context.startActivity(intent) }
+                                        openPhotoExternally(context, photo.uri)
                                     }
                                 }
                             )
@@ -1098,14 +1185,113 @@ private fun ReviewScreen(
     var isDeleting by remember { mutableStateOf(false) }
     val allSelected = selected.size == candidates.size && candidates.isNotEmpty()
     var showGiveUp by remember { mutableStateOf(false) }
+    var pendingDeleteUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var pendingWriteGrantUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
 
-    // 用于 Android 10+ 调用系统删除确认弹窗
-    val deleteLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartIntentSenderForResult()
-    ) { _ ->
-        // 无论用户是确认还是取消，这一轮都结束，回到 Start
+    fun finishRound() {
         isDeleting = false
+        pendingDeleteUris = emptyList()
+        pendingWriteGrantUris = emptyList()
         onDeleteFinished()
+    }
+    var launchTrashRequest: ((List<Uri>) -> Unit)? = null
+
+    // 兜底：申请对目标图片的写权限后，再次尝试强制标记回收站
+    val writeGrantLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode != Activity.RESULT_OK) {
+            isDeleting = false
+            return@rememberLauncherForActivityResult
+        }
+
+        val retryUris = pendingWriteGrantUris
+        if (retryUris.isEmpty()) {
+            isDeleting = false
+            return@rememberLauncherForActivityResult
+        }
+
+        scope.launch {
+            val stillFailed = markPhotosTrashedWithWriteAccess(context, retryUris)
+            if (stillFailed.isEmpty()) {
+                refreshGalleryForUris(context, retryUris)
+                finishRound()
+            } else {
+                pendingWriteGrantUris = stillFailed
+                isDeleting = false
+            }
+        }
+    }
+
+    // 系统确认：回收站请求 / 永久删除请求
+    val deleteRequestLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val targetUris = pendingDeleteUris
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && targetUris.isNotEmpty()) {
+                // 删除后状态校验：若仍未进入回收站，走写权限兜底再强制标记
+                scope.launch {
+                    val stillFailed = verifyPhotosInTrash(context, targetUris)
+                    if (stillFailed.isEmpty()) {
+                        refreshGalleryForUris(context, targetUris)
+                        finishRound()
+                    } else {
+                        pendingWriteGrantUris = stillFailed
+                        runCatching {
+                            val pi = MediaStore.createWriteRequest(
+                                context.contentResolver,
+                                ArrayList(stillFailed)
+                            )
+                            writeGrantLauncher.launch(
+                                androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
+                                    .build()
+                            )
+                        }.onFailure {
+                            isDeleting = false
+                        }
+                    }
+                }
+            } else {
+                finishRound()
+            }
+        } else {
+            // 用户取消时停留在当前页
+            isDeleting = false
+        }
+    }
+    launchTrashRequest = { uris ->
+        if (uris.isEmpty()) {
+            isDeleting = false
+        } else {
+            pendingDeleteUris = uris
+            runCatching {
+                val pi = MediaStore.createTrashRequest(
+                    context.contentResolver,
+                    ArrayList(uris),
+                    /* isTrashed = */ true
+                )
+                deleteRequestLauncher.launch(
+                    androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
+                        .build()
+                )
+            }.onFailure {
+                // 若 TrashRequest 发起失败，先申请写权限，再重试 TrashRequest
+                pendingWriteGrantUris = uris
+                runCatching {
+                    val pi = MediaStore.createWriteRequest(
+                        context.contentResolver,
+                        ArrayList(uris)
+                    )
+                    writeGrantLauncher.launch(
+                        androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
+                            .build()
+                    )
+                }.onFailure {
+                    isDeleting = false
+                }
+            }
+        }
     }
 
     Box(
@@ -1260,45 +1446,19 @@ private fun ReviewScreen(
 
                             when {
                                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
-                                    // Android 11+:
-                                    // 1) 先尝试直接标记 IS_TRASHED=1（部分机型更稳定进入“最近删除”）
-                                    // 2) 对失败项再走系统确认的 TrashRequest
-                                    scope.launch {
-                                        val needUserConfirm = withContext(Dispatchers.IO) {
-                                            val values = ContentValues().apply {
-                                                put(MediaStore.MediaColumns.IS_TRASHED, 1)
-                                            }
-                                            uris.filter { uri ->
-                                                runCatching {
-                                                    context.contentResolver.update(uri, values, null, null) <= 0
-                                                }.getOrElse { true }
-                                            }
-                                        }
-
-                                        if (needUserConfirm.isEmpty()) {
-                                            isDeleting = false
-                                            onDeleteFinished()
-                                        } else {
-                                            val pi = MediaStore.createTrashRequest(
-                                                context.contentResolver,
-                                                needUserConfirm,
-                                                /* isTrashed = */ true
-                                            )
-                                            deleteLauncher.launch(
-                                                androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
-                                                    .build()
-                                            )
-                                        }
+                                    // Android 11+ 官方回收站流程：始终通过系统 TrashRequest 标记为“最近删除”
+                                    launchTrashRequest?.invoke(uris) ?: run {
+                                        isDeleting = false
                                     }
                                 }
 
                                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
-                                    // Android 10 只有永久删除，没有官方“回收站”API
+                                    // Android 10 无官方“回收站”API，只能系统确认后永久删除
                                     val pi = MediaStore.createDeleteRequest(
                                         context.contentResolver,
-                                        uris
+                                        ArrayList(uris)
                                     )
-                                    deleteLauncher.launch(
+                                    deleteRequestLauncher.launch(
                                         androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
                                             .build()
                                     )
@@ -1314,8 +1474,7 @@ private fun ReviewScreen(
                                                 }
                                             }
                                         }
-                                        isDeleting = false
-                                        onDeleteFinished()
+                                        finishRound()
                                     }
                                 }
                             }
@@ -1388,13 +1547,25 @@ private suspend fun loadRandomPhotos(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI
                 }
 
-            // 同时读取 DATE_TAKEN / DATE_ADDED / DATE_MODIFIED，综合判断时间
-            val projection = arrayOf(
-                MediaStore.Images.Media._ID,
-                MediaStore.Images.Media.DATE_TAKEN,
-                MediaStore.Images.Media.DATE_ADDED,
-                MediaStore.Images.Media.DATE_MODIFIED
-            )
+            // 同时读取 DATE_TAKEN / DATE_ADDED / DATE_MODIFIED，综合判断时间。
+            // Android 10+ 额外读取 VOLUME_NAME，确保每张图使用其真实存储卷 URI。
+            val projection =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    arrayOf(
+                        MediaStore.Images.Media._ID,
+                        MediaStore.Images.Media.DATE_TAKEN,
+                        MediaStore.Images.Media.DATE_ADDED,
+                        MediaStore.Images.Media.DATE_MODIFIED,
+                        MediaStore.Images.Media.VOLUME_NAME
+                    )
+                } else {
+                    arrayOf(
+                        MediaStore.Images.Media._ID,
+                        MediaStore.Images.Media.DATE_TAKEN,
+                        MediaStore.Images.Media.DATE_ADDED,
+                        MediaStore.Images.Media.DATE_MODIFIED
+                    )
+                }
 
             context.contentResolver.query(
                 collection,
@@ -1410,6 +1581,12 @@ private suspend fun loadRandomPhotos(
                     cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
                 val dateModifiedColumn =
                     cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
+                val volumeNameColumn =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        cursor.getColumnIndex(MediaStore.Images.Media.VOLUME_NAME)
+                    } else {
+                        -1
+                    }
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idColumn)
                     val rawTaken = cursor.getLong(dateTakenColumn)        // 毫秒或 0
@@ -1424,7 +1601,17 @@ private suspend fun loadRandomPhotos(
                         else -> null
                     }
 
-                    val uri = ContentUris.withAppendedId(collection, id)
+                    val itemCollection = if (
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                        volumeNameColumn >= 0 &&
+                        !cursor.isNull(volumeNameColumn)
+                    ) {
+                        val volumeName = cursor.getString(volumeNameColumn)
+                        MediaStore.Images.Media.getContentUri(volumeName)
+                    } else {
+                        collection
+                    }
+                    val uri = ContentUris.withAppendedId(itemCollection, id)
                     list.add(PhotoItem(uri, timeMillis))
                 }
             }
@@ -1435,6 +1622,110 @@ private suspend fun loadRandomPhotos(
         onError("读取相册失败：${e.message ?: "未知错误"}")
     } finally {
         onFinish()
+    }
+}
+
+private fun isPhotoInTrash(context: Context, uri: Uri): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+    val queryArgs = Bundle().apply {
+        putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE)
+    }
+    return runCatching {
+        context.contentResolver.query(
+            uri,
+            arrayOf(MediaStore.MediaColumns.IS_TRASHED),
+            queryArgs,
+            null
+        )?.use { cursor ->
+            val idx = cursor.getColumnIndex(MediaStore.MediaColumns.IS_TRASHED)
+            idx >= 0 && cursor.moveToFirst() && cursor.getInt(idx) == 1
+        } ?: false
+    }.getOrDefault(false)
+}
+
+private suspend fun verifyPhotosInTrash(
+    context: Context,
+    uris: List<Uri>
+): List<Uri> = withContext(Dispatchers.IO) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext uris
+    if (uris.isEmpty()) return@withContext emptyList()
+
+    suspend fun unresolvedAfterRetry(target: List<Uri>): List<Uri> {
+        var unresolvedLocal = target
+        repeat(4) { attempt ->
+            unresolvedLocal = unresolvedLocal.filterNot { isPhotoInTrash(context, it) }
+            if (unresolvedLocal.isEmpty()) return unresolvedLocal
+            if (attempt < 3) kotlinx.coroutines.delay(180)
+        }
+        return unresolvedLocal
+    }
+
+    var unresolved = unresolvedAfterRetry(uris)
+    unresolved
+}
+
+private suspend fun markPhotosTrashedWithWriteAccess(
+    context: Context,
+    uris: List<Uri>
+): List<Uri> = withContext(Dispatchers.IO) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext uris
+    if (uris.isEmpty()) return@withContext emptyList()
+
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.IS_TRASHED, 1)
+    }
+
+    uris.forEach { uri ->
+        runCatching {
+            context.contentResolver.update(uri, values, null, null)
+        }
+    }
+
+    verifyPhotosInTrash(context, uris)
+}
+
+private fun refreshGalleryForUris(context: Context, uris: List<Uri>) {
+    uris.forEach { uri ->
+        runCatching { context.contentResolver.notifyChange(uri, null) }
+        runCatching {
+            context.sendBroadcast(
+                Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, uri)
+            )
+        }
+    }
+}
+
+private fun openPhotoExternally(context: Context, uri: Uri) {
+    val mime = context.contentResolver.getType(uri) ?: "image/*"
+    val baseIntent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, mime)
+        clipData = ClipData.newUri(context.contentResolver, "photo", uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    // MIUI 上优先尝试系统相册，降低解析到错误图片的概率。
+    val candidates = mutableListOf<Intent>()
+    val manufacturer = Build.MANUFACTURER?.lowercase(Locale.ROOT).orEmpty()
+    if (manufacturer.contains("xiaomi") || manufacturer.contains("redmi") || manufacturer.contains("poco")) {
+        candidates += Intent(baseIntent).apply { `package` = "com.miui.gallery" }
+    }
+    candidates += baseIntent
+    candidates += Intent(Intent.ACTION_VIEW).apply {
+        data = uri
+        clipData = ClipData.newUri(context.contentResolver, "photo", uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    for (intent in candidates) {
+        val launched = runCatching {
+            if (intent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(intent)
+                true
+            } else {
+                false
+            }
+        }.getOrDefault(false)
+        if (launched) return
     }
 }
 
