@@ -24,6 +24,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -33,6 +34,8 @@ import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.gestures.rememberScrollableState
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -45,8 +48,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -82,6 +89,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import androidx.exifinterface.media.ExifInterface
 import android.location.Geocoder
@@ -115,7 +123,8 @@ class MainActivity : ComponentActivity() {
 
 private data class PhotoItem(
     val uri: Uri,
-    val dateTaken: Long?
+    val dateTaken: Long?,
+    val dateExpiresSec: Long? = null
 )
 
 private enum class ScreenState {
@@ -123,11 +132,93 @@ private enum class ScreenState {
     Start,
     Swiping,
     Review,
-    AllMemories
+    AllMemories,
+    TrashBin
 }
+
+private val COUNT_OPTIONS = listOf(10, 20, 30, 50, 100)
 
 private const val APP_PREFS_NAME = "random_delete_prefs"
 private const val PREF_KEY_SWIPE_MUTED = "swipe_muted"
+private const val PREF_KEY_APP_TRASHED_MEDIA_KEYS = "app_trashed_media_keys"
+
+private enum class PermissionAction {
+    StartSwipe,
+    OpenTrashBin
+}
+
+private fun normalizeCountOption(value: Int): Int {
+    return COUNT_OPTIONS.minByOrNull { option -> abs(option - value) } ?: COUNT_OPTIONS.first()
+}
+
+private fun mediaKeyForUri(uri: Uri): String? {
+    val id = runCatching { ContentUris.parseId(uri) }.getOrNull() ?: return null
+    val volume = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        uri.pathSegments.firstOrNull().orEmpty().ifBlank { MediaStore.VOLUME_EXTERNAL }
+    } else {
+        "external"
+    }
+    return "$volume:$id"
+}
+
+private fun getAppTrashedMediaKeys(context: Context): MutableSet<String> {
+    val prefs = context.getSharedPreferences(APP_PREFS_NAME, Context.MODE_PRIVATE)
+    return prefs.getStringSet(PREF_KEY_APP_TRASHED_MEDIA_KEYS, emptySet())
+        ?.toMutableSet()
+        ?: mutableSetOf()
+}
+
+private fun saveAppTrashedMediaKeys(context: Context, keys: Set<String>) {
+    val prefs = context.getSharedPreferences(APP_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit()
+        .putStringSet(PREF_KEY_APP_TRASHED_MEDIA_KEYS, keys.toSet())
+        .apply()
+}
+
+private fun markAppTrashedUris(context: Context, uris: List<Uri>) {
+    if (uris.isEmpty()) return
+    val addKeys = uris.mapNotNull(::mediaKeyForUri).toSet()
+    if (addKeys.isEmpty()) return
+    val keys = getAppTrashedMediaKeys(context)
+    if (keys.addAll(addKeys)) {
+        saveAppTrashedMediaKeys(context, keys)
+    }
+}
+
+private fun unmarkAppTrashedUris(context: Context, uris: List<Uri>) {
+    if (uris.isEmpty()) return
+    val removeKeys = uris.mapNotNull(::mediaKeyForUri).toSet()
+    if (removeKeys.isEmpty()) return
+    val keys = getAppTrashedMediaKeys(context)
+    if (keys.removeAll(removeKeys)) {
+        saveAppTrashedMediaKeys(context, keys)
+    }
+}
+
+private fun filterAppOwnedTrashedPhotos(
+    context: Context,
+    photos: List<PhotoItem>
+): List<PhotoItem> {
+    if (photos.isEmpty()) {
+        val existing = getAppTrashedMediaKeys(context)
+        if (existing.isNotEmpty()) {
+            saveAppTrashedMediaKeys(context, emptySet())
+        }
+        return emptyList()
+    }
+
+    val trackedKeys = getAppTrashedMediaKeys(context)
+    if (trackedKeys.isEmpty()) return emptyList()
+
+    val filtered = photos.filter { photo ->
+        mediaKeyForUri(photo.uri)?.let { it in trackedKeys } == true
+    }
+    val validKeys = filtered.mapNotNull { mediaKeyForUri(it.uri) }.toSet()
+    if (validKeys != trackedKeys) {
+        saveAppTrashedMediaKeys(context, validKeys)
+    }
+    return filtered
+}
 
 @Composable
 private fun RandomDeleteApp(modifier: Modifier = Modifier) {
@@ -143,13 +234,14 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
     var currentIndex by remember { mutableStateOf(0) }
     val deleteCandidates = remember { mutableStateListOf<PhotoItem>() }
 
-    // 本轮计划浏览的图片数量，默认 10，最大 30
+    // 本轮计划浏览的图片数量，固定选项：10/20/30/50/100
     var desiredCount by remember { mutableStateOf(10) }
 
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     // 默认非静音；用户切换后持久化，直到下次再次切换
     var isSwipeMuted by remember { mutableStateOf(prefs.getBoolean(PREF_KEY_SWIPE_MUTED, false)) }
+    var pendingPermissionAction by remember { mutableStateOf(PermissionAction.StartSwipe) }
 
     // 启动时垃圾桶动画结束后进入 Start 页面
     LaunchedEffect(Unit) {
@@ -168,31 +260,39 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            // 拿到权限后加载图片
-            scope.launch {
-                loadRandomPhotos(
-                    context = context,
-                    onStartLoading = { isLoading = true; errorMessage = null },
-                    onFinish = { isLoading = false },
-                    onLoaded = { list ->
-                        allPhotos = list
-                        if (list.isEmpty()) {
-                            errorMessage = "相册中没有找到图片。"
-                            screenState = ScreenState.Start
-                        } else {
-                            val shuffled = list.shuffled(Random(System.currentTimeMillis()))
-                            val count = desiredCount.coerceIn(10, 30)
-                            swipePhotos = shuffled.take(min(count, shuffled.size))
-                            deleteCandidates.clear()
-                            currentIndex = 0
-                            screenState = ScreenState.Swiping
-                        }
-                    },
-                    onError = { msg ->
-                        errorMessage = msg
-                        screenState = ScreenState.Start
+            when (pendingPermissionAction) {
+                PermissionAction.StartSwipe -> {
+                    // 拿到权限后加载图片
+                    scope.launch {
+                        loadRandomPhotos(
+                            context = context,
+                            onStartLoading = { isLoading = true; errorMessage = null },
+                            onFinish = { isLoading = false },
+                            onLoaded = { list ->
+                                allPhotos = list
+                                if (list.isEmpty()) {
+                                    errorMessage = "相册中没有找到图片。"
+                                    screenState = ScreenState.Start
+                                } else {
+                                    val shuffled = list.shuffled(Random(System.currentTimeMillis()))
+                                    val count = normalizeCountOption(desiredCount)
+                                    swipePhotos = shuffled.take(min(count, shuffled.size))
+                                    deleteCandidates.clear()
+                                    currentIndex = 0
+                                    screenState = ScreenState.Swiping
+                                }
+                            },
+                            onError = { msg ->
+                                errorMessage = msg
+                                screenState = ScreenState.Start
+                            }
+                        )
                     }
-                )
+                }
+                PermissionAction.OpenTrashBin -> {
+                    errorMessage = null
+                    screenState = ScreenState.TrashBin
+                }
             }
         } else {
             errorMessage = "未授予读取相册权限，无法随机选择图片。"
@@ -211,7 +311,18 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                     errorMessage = errorMessage,
                     selectedCount = desiredCount,
                     onCountChange = { newCount ->
-                        desiredCount = newCount.coerceIn(10, 30)
+                        desiredCount = normalizeCountOption(newCount)
+                    },
+                    onTrashClick = {
+                        if (context.checkSelfPermission(permission) ==
+                            PackageManager.PERMISSION_GRANTED
+                        ) {
+                            errorMessage = null
+                            screenState = ScreenState.TrashBin
+                        } else {
+                            pendingPermissionAction = PermissionAction.OpenTrashBin
+                            permissionLauncher.launch(permission)
+                        }
                     },
                     onStartClick = {
                         // 如果已经有权限就直接加载，否则请求权限
@@ -229,7 +340,7 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                                             errorMessage = "相册中没有找到图片。"
                                         } else {
                                             val shuffled = list.shuffled(Random(System.currentTimeMillis()))
-                                            val count = desiredCount.coerceIn(10, 30)
+                                            val count = normalizeCountOption(desiredCount)
                                             swipePhotos = shuffled.take(min(count, shuffled.size))
                                             deleteCandidates.clear()
                                             currentIndex = 0
@@ -242,6 +353,7 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                                 )
                             }
                         } else {
+                            pendingPermissionAction = PermissionAction.StartSwipe
                             permissionLauncher.launch(permission)
                         }
                     }
@@ -331,6 +443,15 @@ private fun RandomDeleteApp(modifier: Modifier = Modifier) {
                         swipePhotos = emptyList()
                         allPhotos = emptyList()
                         currentIndex = 0
+                        errorMessage = null
+                    }
+                )
+            }
+
+            ScreenState.TrashBin -> {
+                TrashBinScreen(
+                    onBackToStart = {
+                        screenState = ScreenState.Start
                         errorMessage = null
                     }
                 )
@@ -482,6 +603,7 @@ private fun StartScreen(
     errorMessage: String?,
     selectedCount: Int,
     onCountChange: (Int) -> Unit,
+    onTrashClick: () -> Unit,
     onStartClick: () -> Unit
 ) {
     Box(
@@ -495,25 +617,34 @@ private fun StartScreen(
                 .fillMaxWidth()
                 .padding(24.dp)
         ) {
+            Text(
+                text = "点击进入回收站",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.75f)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
             Image(
                 painter = painterResource(id = R.drawable.icon),
                 contentDescription = "app icon",
-                modifier = Modifier.size(120.dp),
+                modifier = Modifier
+                    .size(120.dp)
+                    .clickable { onTrashClick() },
                 contentScale = ContentScale.Fit
             )
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 这次要看几张图？ + 滚轮样式选择器（10～30，循环）
-            Text(
-                text = "这次要看几张图？",
-                style = MaterialTheme.typography.titleMedium
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-
-            val minCount = 10
-            val maxCount = 30
-            fun inc(value: Int): Int = if (value >= maxCount) minCount else value + 1
-            fun dec(value: Int): Int = if (value <= minCount) maxCount else value - 1
+            val options = COUNT_OPTIONS
+            val normalizedSelectedCount = normalizeCountOption(selectedCount)
+            val selectedNumberFontSize = 24.sp
+            fun indexOfOption(value: Int): Int = options.indexOf(normalizeCountOption(value))
+            fun inc(value: Int): Int {
+                val idx = indexOfOption(value)
+                return options[(idx + 1) % options.size]
+            }
+            fun dec(value: Int): Int {
+                val idx = indexOfOption(value)
+                return options[(idx - 1 + options.size) % options.size]
+            }
 
             val haptic = LocalHapticFeedback.current
 
@@ -529,19 +660,20 @@ private fun StartScreen(
                 // scrollable 的 delta 是“内容移动”距离，这里向上滑时 delta 为负
                 val deltaItems = deltaPx / itemHeightPx
                 wheelOffset += deltaItems
+                var currentValueForScroll = normalizedSelectedCount
 
                 // 每跨过 0.5 个 item，就切换一次数字并重置偏移，形成循环滚动
                 while (wheelOffset <= -0.5f) {
-                    val newValue = inc(selectedCount)
-                    onCountChange(newValue)
+                    currentValueForScroll = inc(currentValueForScroll)
+                    onCountChange(currentValueForScroll)
                     wheelOffset += 1f
                     haptic.performHapticFeedback(
                         androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove
                     )
                 }
                 while (wheelOffset >= 0.5f) {
-                    val newValue = dec(selectedCount)
-                    onCountChange(newValue)
+                    currentValueForScroll = dec(currentValueForScroll)
+                    onCountChange(currentValueForScroll)
                     wheelOffset -= 1f
                     haptic.performHapticFeedback(
                         androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove
@@ -552,76 +684,95 @@ private fun StartScreen(
                 deltaPx
             }
 
-            Box(
-                modifier = Modifier
-                    .width(160.dp)
-                    .border(
-                        width = 1.dp,
-                        color = Color.LightGray,
-                        shape = RoundedCornerShape(16.dp)
-                    )
-                    .padding(vertical = 16.dp, horizontal = 12.dp)
-                    .scrollable(
-                        state = scrollState,
-                        orientation = Orientation.Vertical,
-                        flingBehavior = ScrollableDefaults.flingBehavior(),
-                        enabled = true
-                    )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                // 显示多个可见项，形成 3D 滚轮效果
-                val visibleCount = 7 // 中间 + 上下各 3
-                val half = visibleCount / 2
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth()
+                val sideLabelWidth = 56.dp
+                Text(
+                    text = "浏览",
+                    fontSize = selectedNumberFontSize,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.width(sideLabelWidth)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+
+                Box(
+                    modifier = Modifier
+                        .width(160.dp)
+                        .padding(vertical = 16.dp, horizontal = 12.dp)
+                        .scrollable(
+                            state = scrollState,
+                            orientation = Orientation.Vertical,
+                            flingBehavior = ScrollableDefaults.flingBehavior(),
+                            enabled = true
+                        )
                 ) {
-                    for (i in -half..half) {
-                        val position = i.toFloat()
-                        // 当前项相对于中心的距离（加上滚轮偏移）
-                        val distanceFromCenter = position + wheelOffset
-                        val absDistance = kotlin.math.abs(distanceFromCenter)
+                    // 显示多个可见项，形成 3D 滚轮效果
+                    val visibleCount = 7 // 中间 + 上下各 3
+                    val half = visibleCount / 2
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        for (i in -half..half) {
+                            val position = i.toFloat()
+                            // 当前项相对于中心的距离（加上滚轮偏移）
+                            val distanceFromCenter = position + wheelOffset
+                            val absDistance = kotlin.math.abs(distanceFromCenter)
 
-                        // 缩放 + 透明度 + 轻微 3D 旋转
-                        val scale = 1f - 0.12f * absDistance.coerceIn(0f, 3f)
-                        val alpha = 1f - 0.35f * absDistance.coerceIn(0f, 3f)
-                        val rotationX = 18f * distanceFromCenter
+                            // 缩放 + 透明度 + 轻微 3D 旋转
+                            val scale = 1f - 0.12f * absDistance.coerceIn(0f, 3f)
+                            val alpha = 1f - 0.35f * absDistance.coerceIn(0f, 3f)
+                            val rotationX = 18f * distanceFromCenter
 
-                        // 以 selectedCount 为中心，向上/向下依次递增/递减，形成循环
-                        val value = when {
-                            i == 0 -> selectedCount
-                            i > 0 -> {
-                                var v = selectedCount
-                                repeat(i) { v = inc(v) }
-                                v
-                            }
-                            else -> {
-                                var v = selectedCount
-                                repeat(-i) { v = dec(v) }
-                                v
-                            }
-                        }
-
-                        Box(
-                            modifier = Modifier
-                                .height(32.dp)
-                                .fillMaxWidth(),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = value.toString(),
-                                style = MaterialTheme.typography.bodyLarge,
-                                fontWeight = if (i == 0) FontWeight.Bold else FontWeight.Normal,
-                                color = MaterialTheme.colorScheme.onBackground.copy(alpha = alpha),
-                                modifier = Modifier.graphicsLayer {
-                                    this.scaleX = scale
-                                    this.scaleY = scale
-                                    this.rotationX = rotationX
-                                    this.transformOrigin = TransformOrigin(0.5f, 0.5f)
+                            // 以 selectedCount 为中心，向上/向下依次递增/递减，形成循环
+                            val value = when {
+                                i == 0 -> normalizedSelectedCount
+                                i > 0 -> {
+                                    var v = normalizedSelectedCount
+                                    repeat(i) { v = inc(v) }
+                                    v
                                 }
-                            )
+                                else -> {
+                                    var v = normalizedSelectedCount
+                                    repeat(-i) { v = dec(v) }
+                                    v
+                                }
+                            }
+
+                            Box(
+                                modifier = Modifier
+                                    .height(32.dp)
+                                    .fillMaxWidth(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = value.toString(),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontSize = if (i == 0) selectedNumberFontSize else 18.sp,
+                                    fontWeight = if (i == 0) FontWeight.Bold else FontWeight.Normal,
+                                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = alpha),
+                                    modifier = Modifier.graphicsLayer {
+                                        this.scaleX = scale
+                                        this.scaleY = scale
+                                        this.rotationX = rotationX
+                                        this.transformOrigin = TransformOrigin(0.5f, 0.5f)
+                                    }
+                                )
+                            }
                         }
                     }
                 }
+
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = "张",
+                    fontSize = selectedNumberFontSize,
+                    textAlign = TextAlign.Start,
+                    modifier = Modifier.width(sideLabelWidth)
+                )
             }
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -740,6 +891,13 @@ private fun SwipeScreen(
         val progress = kotlin.math.max(progressX, progressY)
         0.9f * progress
     }
+    val nextPreviewAlpha = if (offsetY < 0f || kotlin.math.abs(offsetX) > kotlin.math.abs(offsetY)) {
+        nextAlpha
+    } else {
+        0f
+    }
+    val prevPreviewAlpha = if (offsetY > 0f) prevAlpha else 0f
+    val currentPhotoAlpha = if (hideCurrentPhotoDuringExit) 0f else alpha
 
     Box(
         modifier = Modifier
@@ -922,7 +1080,7 @@ private fun SwipeScreen(
                             .fillMaxSize()
                             .border(
                                 width = 1.dp,
-                                color = Color.LightGray,
+                                color = Color.LightGray.copy(alpha = nextPreviewAlpha),
                                 shape = RoundedCornerShape(16.dp)
                             ),
                         contentAlignment = Alignment.Center
@@ -934,7 +1092,7 @@ private fun SwipeScreen(
                                 .fillMaxSize()
                                 .padding(8.dp),
                             contentScale = ContentScale.Fit,
-                            alpha = if (offsetY < 0f || kotlin.math.abs(offsetX) > kotlin.math.abs(offsetY)) nextAlpha else 0f
+                            alpha = nextPreviewAlpha
                         )
                     }
                 }
@@ -946,7 +1104,7 @@ private fun SwipeScreen(
                             .fillMaxSize()
                             .border(
                                 width = 1.dp,
-                                color = Color.LightGray,
+                                color = Color.LightGray.copy(alpha = prevPreviewAlpha),
                                 shape = RoundedCornerShape(16.dp)
                             ),
                         contentAlignment = Alignment.Center
@@ -958,7 +1116,7 @@ private fun SwipeScreen(
                                 .fillMaxSize()
                                 .padding(8.dp),
                             contentScale = ContentScale.Fit,
-                            alpha = if (offsetY > 0f) prevAlpha else 0f
+                            alpha = prevPreviewAlpha
                         )
                     }
                 }
@@ -970,11 +1128,11 @@ private fun SwipeScreen(
                         .graphicsLayer {
                             translationX = offsetX
                             translationY = offsetY
-                            this.alpha = if (hideCurrentPhotoDuringExit) 0f else alpha
+                            this.alpha = currentPhotoAlpha
                         }
                         .border(
                             width = 1.dp,
-                            color = Color.LightGray,
+                            color = Color.LightGray.copy(alpha = currentPhotoAlpha),
                             shape = RoundedCornerShape(16.dp)
                         )
                         .pointerInput(photo.uri) {
@@ -1187,11 +1345,13 @@ private fun ReviewScreen(
     var showGiveUp by remember { mutableStateOf(false) }
     var pendingDeleteUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var pendingWriteGrantUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var retryTrashRequestAfterWriteGrant by remember { mutableStateOf(false) }
 
     fun finishRound() {
         isDeleting = false
         pendingDeleteUris = emptyList()
         pendingWriteGrantUris = emptyList()
+        retryTrashRequestAfterWriteGrant = false
         onDeleteFinished()
     }
     var launchTrashRequest: ((List<Uri>) -> Unit)? = null
@@ -1201,20 +1361,34 @@ private fun ReviewScreen(
         contract = ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
         if (result.resultCode != Activity.RESULT_OK) {
+            retryTrashRequestAfterWriteGrant = false
             isDeleting = false
             return@rememberLauncherForActivityResult
         }
 
         val retryUris = pendingWriteGrantUris
+        pendingWriteGrantUris = emptyList()
         if (retryUris.isEmpty()) {
+            retryTrashRequestAfterWriteGrant = false
             isDeleting = false
             return@rememberLauncherForActivityResult
         }
 
         scope.launch {
+            if (retryTrashRequestAfterWriteGrant) {
+                retryTrashRequestAfterWriteGrant = false
+                launchTrashRequest?.invoke(retryUris) ?: run {
+                    isDeleting = false
+                }
+                return@launch
+            }
+
             val stillFailed = markPhotosTrashedWithWriteAccess(context, retryUris)
+            val succeeded = retryUris.filterNot { it in stillFailed.toSet() }
+            if (succeeded.isNotEmpty()) {
+                markAppTrashedUris(context, succeeded)
+            }
             if (stillFailed.isEmpty()) {
-                refreshGalleryForUris(context, retryUris)
                 finishRound()
             } else {
                 pendingWriteGrantUris = stillFailed
@@ -1233,10 +1407,14 @@ private fun ReviewScreen(
                 // 删除后状态校验：若仍未进入回收站，走写权限兜底再强制标记
                 scope.launch {
                     val stillFailed = verifyPhotosInTrash(context, targetUris)
+                    val succeeded = targetUris.filterNot { it in stillFailed.toSet() }
+                    if (succeeded.isNotEmpty()) {
+                        markAppTrashedUris(context, succeeded)
+                    }
                     if (stillFailed.isEmpty()) {
-                        refreshGalleryForUris(context, targetUris)
                         finishRound()
                     } else {
+                        retryTrashRequestAfterWriteGrant = false
                         pendingWriteGrantUris = stillFailed
                         runCatching {
                             val pi = MediaStore.createWriteRequest(
@@ -1277,6 +1455,7 @@ private fun ReviewScreen(
                 )
             }.onFailure {
                 // 若 TrashRequest 发起失败，先申请写权限，再重试 TrashRequest
+                retryTrashRequestAfterWriteGrant = true
                 pendingWriteGrantUris = uris
                 runCatching {
                     val pi = MediaStore.createWriteRequest(
@@ -1288,6 +1467,7 @@ private fun ReviewScreen(
                             .build()
                     )
                 }.onFailure {
+                    retryTrashRequestAfterWriteGrant = false
                     isDeleting = false
                 }
             }
@@ -1525,6 +1705,438 @@ private fun AllBeautifulMemoriesScreen(
     }
 }
 
+@Composable
+private fun TrashBinScreen(
+    onBackToStart: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var trashedPhotos by remember { mutableStateOf<List<PhotoItem>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var actionMessage by remember { mutableStateOf<String?>(null) }
+    var isActionError by remember { mutableStateOf(false) }
+    var pendingRestoreUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var pendingDeleteUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var previewPhoto by remember { mutableStateOf<PhotoItem?>(null) }
+    val selectedForRestore = remember { mutableStateListOf<Uri>() }
+
+    suspend fun refreshTrashedList() {
+        loadTrashedPhotos(
+            context = context,
+            onStartLoading = { isLoading = true; errorMessage = null },
+            onFinish = { isLoading = false },
+            onLoaded = { list ->
+                val appOwned = filterAppOwnedTrashedPhotos(context, list)
+                trashedPhotos = appOwned
+                val existing = appOwned.map { it.uri }.toSet()
+                selectedForRestore.removeAll { it !in existing }
+            },
+            onError = { msg -> errorMessage = msg }
+        )
+    }
+
+    suspend fun restorePhotosDirect(uris: List<Uri>): List<Uri> = withContext(Dispatchers.IO) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext uris
+        if (uris.isEmpty()) return@withContext emptyList()
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.IS_TRASHED, 0)
+        }
+        uris.filter { uri ->
+            val updated = runCatching {
+                context.contentResolver.update(uri, values, null, null)
+            }.getOrDefault(0)
+            updated <= 0 || isPhotoInTrash(context, uri)
+        }
+    }
+
+    fun countdownLabel(expireSec: Long?): String {
+        if (expireSec == null || expireSec <= 0L) return "--d"
+        val nowSec = System.currentTimeMillis() / 1000L
+        val remainingSec = (expireSec - nowSec).coerceAtLeast(0L)
+        val daySec = 24L * 60L * 60L
+        val days = (remainingSec + daySec - 1L) / daySec
+        return "${days}d"
+    }
+
+    val restoreWriteLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        val uris = pendingRestoreUris
+        pendingRestoreUris = emptyList()
+        if (result.resultCode != Activity.RESULT_OK || uris.isEmpty()) {
+            actionMessage = "恢复失败：未完成授权。"
+            isActionError = true
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            val failed = restorePhotosDirect(uris)
+            val succeeded = uris.filterNot { it in failed.toSet() }
+            if (succeeded.isNotEmpty()) {
+                unmarkAppTrashedUris(context, succeeded)
+                selectedForRestore.removeAll { it in succeeded.toSet() }
+            }
+            if (failed.isEmpty()) {
+                actionMessage = if (uris.size == 1) "已恢复该图片。" else "已恢复 ${uris.size} 张图片。"
+                isActionError = false
+                refreshTrashedList()
+            } else {
+                actionMessage = "恢复失败：${failed.size} 张图片仍无法恢复。"
+                isActionError = true
+            }
+        }
+    }
+
+    val permanentDeleteLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        val uris = pendingDeleteUris
+        pendingDeleteUris = emptyList()
+        if (result.resultCode == Activity.RESULT_OK && uris.isNotEmpty()) {
+            scope.launch {
+                unmarkAppTrashedUris(context, uris)
+                selectedForRestore.removeAll { it in uris.toSet() }
+                actionMessage = if (uris.size == 1) "已永久删除该图片。" else "已永久删除 ${uris.size} 张图片。"
+                isActionError = false
+                refreshTrashedList()
+            }
+        } else {
+            actionMessage = "永久删除已取消或失败。"
+            isActionError = true
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            errorMessage = "当前系统版本不支持回收站展示（需要 Android 11+）。"
+            trashedPhotos = emptyList()
+            return@LaunchedEffect
+        }
+        refreshTrashedList()
+    }
+
+    fun requestRestore(uris: List<Uri>) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            actionMessage = "当前系统版本不支持恢复。"
+            isActionError = true
+            return
+        }
+        if (uris.isEmpty()) {
+            actionMessage = "请先选择要恢复的图片。"
+            isActionError = true
+            return
+        }
+        scope.launch {
+            val failed = restorePhotosDirect(uris)
+            val succeeded = uris.filterNot { it in failed.toSet() }
+            if (succeeded.isNotEmpty()) {
+                unmarkAppTrashedUris(context, succeeded)
+                selectedForRestore.removeAll { it in succeeded.toSet() }
+            }
+            if (failed.isEmpty()) {
+                actionMessage = if (uris.size == 1) "已恢复该图片。" else "已恢复 ${uris.size} 张图片。"
+                isActionError = false
+                refreshTrashedList()
+            } else {
+                pendingRestoreUris = failed
+                runCatching {
+                    val pi = MediaStore.createWriteRequest(
+                        context.contentResolver,
+                        ArrayList(failed)
+                    )
+                    restoreWriteLauncher.launch(
+                        androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
+                            .build()
+                    )
+                }.onFailure {
+                    actionMessage = "恢复失败：无法申请修改权限。"
+                    isActionError = true
+                }
+            }
+        }
+    }
+
+    fun requestPermanentDelete(uris: List<Uri>) {
+        if (uris.isEmpty()) {
+            actionMessage = "回收站里没有可删除的图片。"
+            isActionError = true
+            return
+        }
+        pendingDeleteUris = uris
+        runCatching {
+            val pi = MediaStore.createDeleteRequest(
+                context.contentResolver,
+                ArrayList(uris)
+            )
+            permanentDeleteLauncher.launch(
+                androidx.activity.result.IntentSenderRequest.Builder(pi.intentSender)
+                    .build()
+            )
+        }.onFailure {
+            actionMessage = "永久删除失败：无法打开系统确认。"
+            isActionError = true
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        val hasSelection = selectedForRestore.isNotEmpty()
+        val allVisibleSelected = trashedPhotos.isNotEmpty() &&
+            trashedPhotos.all { selectedForRestore.contains(it.uri) }
+        val actionOverlayReserve = if (hasSelection) 132.dp else 8.dp
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = "回收站",
+                    style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onBackToStart) {
+                        Text(
+                            text = "←",
+                            fontSize = 24.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Button(
+                        onClick = {
+                            if (allVisibleSelected) {
+                                selectedForRestore.clear()
+                            } else {
+                                selectedForRestore.clear()
+                                selectedForRestore.addAll(trashedPhotos.map { it.uri })
+                            }
+                        },
+                        enabled = !isLoading && trashedPhotos.isNotEmpty()
+                    ) {
+                        Text(if (allVisibleSelected) "取消" else "全选")
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "单击缩略图可选择，双击可预览放大。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.75f)
+            )
+            if (actionMessage != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = actionMessage ?: "",
+                    color = if (isActionError) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                when {
+                    isLoading -> {
+                        Text("读取回收站中...")
+                    }
+                    errorMessage != null -> {
+                        Text(
+                            text = errorMessage ?: "读取回收站失败",
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                    trashedPhotos.isEmpty() -> {
+                        Text("本应用回收站里还没有图片。")
+                    }
+                    else -> {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(3),
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(bottom = actionOverlayReserve),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            gridItems(trashedPhotos, key = { it.uri.toString() }) { photo ->
+                                val isSelected = selectedForRestore.contains(photo.uri)
+                                val countdownText = remember(photo.dateExpiresSec) {
+                                    countdownLabel(photo.dateExpiresSec)
+                                }
+
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(1f)
+                                        .border(
+                                            width = if (isSelected) 4.dp else 2.dp,
+                                            color = if (isSelected) Color(0xFFD32F2F)
+                                            else Color.LightGray,
+                                            shape = RoundedCornerShape(8.dp)
+                                        )
+                                ) {
+                                    AsyncImage(
+                                        model = photo.uri,
+                                        contentDescription = "trashed photo",
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .pointerInput(photo.uri) {
+                                                detectTapGestures(
+                                                    onTap = {
+                                                        if (selectedForRestore.contains(photo.uri)) {
+                                                            selectedForRestore.remove(photo.uri)
+                                                        } else {
+                                                            selectedForRestore.add(photo.uri)
+                                                        }
+                                                    },
+                                                    onDoubleTap = {
+                                                        previewPhoto = photo
+                                                    }
+                                                )
+                                            },
+                                        contentScale = ContentScale.Crop
+                                    )
+                                    if (isSelected) {
+                                        Text(
+                                            text = "✕",
+                                            color = Color(0xFFD32F2F),
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .padding(4.dp)
+                                                .background(
+                                                    color = Color.White.copy(alpha = 0.9f),
+                                                    shape = RoundedCornerShape(10.dp)
+                                                )
+                                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    } else {
+                                        Text(
+                                            text = countdownText,
+                                            color = Color.White,
+                                            fontSize = 10.sp,
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .padding(4.dp)
+                                                .background(
+                                                    color = Color.Black.copy(alpha = 0.6f),
+                                                    shape = RoundedCornerShape(10.dp)
+                                                )
+                                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (hasSelection) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(
+                        color = MaterialTheme.colorScheme.surface,
+                        shape = RoundedCornerShape(10.dp)
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = Color.LightGray,
+                        shape = RoundedCornerShape(10.dp)
+                    )
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("已选择 ${selectedForRestore.size} 张")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Button(
+                            onClick = { requestRestore(selectedForRestore.toList()) },
+                            enabled = !isLoading && selectedForRestore.isNotEmpty(),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("恢复图片")
+                        }
+                        Button(
+                            onClick = { requestPermanentDelete(selectedForRestore.toList()) },
+                            enabled = !isLoading && selectedForRestore.isNotEmpty(),
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFFD32F2F),
+                                contentColor = Color.White
+                            )
+                        ) {
+                            Text("永久删除")
+                        }
+                    }
+                }
+            }
+        }
+
+        if (previewPhoto != null) {
+            val previewTimeText = remember(previewPhoto?.dateTaken) {
+                previewPhoto?.dateTaken?.let {
+                    val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+                    "时间：${fmt.format(Date(it))}"
+                } ?: "无时间信息"
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.85f))
+                    .clickable { previewPhoto = null },
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = previewTimeText,
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier
+                            .background(
+                                color = Color.Black.copy(alpha = 0.5f),
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    AsyncImage(
+                        model = previewPhoto?.uri,
+                        contentDescription = "preview",
+                        modifier = Modifier.fillMaxWidth(),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            }
+        }
+    }
+}
+
 /**
  * 从系统相册中随机读取图片
  * 作为 suspend 函数，通过协程在 IO 线程执行查询。
@@ -1625,8 +2237,147 @@ private suspend fun loadRandomPhotos(
     }
 }
 
+private suspend fun loadTrashedPhotos(
+    context: Context,
+    onStartLoading: () -> Unit,
+    onFinish: () -> Unit,
+    onLoaded: (List<PhotoItem>) -> Unit,
+    onError: (String) -> Unit
+) {
+    onStartLoading()
+    try {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            onLoaded(emptyList())
+            return
+        }
+
+        val photos = withContext(Dispatchers.IO) {
+            val list = mutableListOf<PhotoItem>()
+            val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            val projection = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DATE_TAKEN,
+                MediaStore.Images.Media.DATE_ADDED,
+                MediaStore.Images.Media.DATE_MODIFIED,
+                MediaStore.Images.Media.VOLUME_NAME,
+                MediaStore.MediaColumns.DATE_EXPIRES
+            )
+            val queryArgs = Bundle().apply {
+                putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_ONLY)
+                putString(
+                    android.content.ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
+                    "${MediaStore.MediaColumns.DATE_EXPIRES} DESC"
+                )
+            }
+
+            context.contentResolver.query(
+                collection,
+                projection,
+                queryArgs,
+                null
+            )?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val dateTakenColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
+                val dateAddedColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+                val dateModifiedColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
+                val volumeNameColumn = cursor.getColumnIndex(MediaStore.Images.Media.VOLUME_NAME)
+                val dateExpiresColumn = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_EXPIRES)
+
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    val rawTaken = cursor.getLong(dateTakenColumn)
+                    val rawAdded = cursor.getLong(dateAddedColumn)
+                    val rawModified = cursor.getLong(dateModifiedColumn)
+                    val rawExpiresSec = if (
+                        dateExpiresColumn >= 0 && !cursor.isNull(dateExpiresColumn)
+                    ) cursor.getLong(dateExpiresColumn) else null
+                    val timeMillis: Long? = when {
+                        rawTaken > 0L -> rawTaken
+                        rawModified > 0L -> rawModified * 1000L
+                        rawAdded > 0L -> rawAdded * 1000L
+                        else -> null
+                    }
+
+                    val itemCollection = if (
+                        volumeNameColumn >= 0 &&
+                        !cursor.isNull(volumeNameColumn)
+                    ) {
+                        val volumeName = cursor.getString(volumeNameColumn)
+                        MediaStore.Images.Media.getContentUri(volumeName)
+                    } else {
+                        collection
+                    }
+                    val uri = ContentUris.withAppendedId(itemCollection, id)
+                    list.add(PhotoItem(uri, timeMillis, rawExpiresSec))
+                }
+            }
+            val nowSec = System.currentTimeMillis() / 1000L
+            val daySec = 24L * 60L * 60L
+            fun remainingDays(expireSec: Long?): Long {
+                if (expireSec == null || expireSec <= 0L) return -1L
+                val remainingSec = (expireSec - nowSec).coerceAtLeast(0L)
+                return (remainingSec + daySec - 1L) / daySec
+            }
+
+            list.sortedWith(
+                compareByDescending<PhotoItem> { remainingDays(it.dateExpiresSec) }
+                    // 同剩余天数下，过期时间更晚通常代表删除时间更晚（最近删除优先）
+                    .thenByDescending { it.dateExpiresSec ?: Long.MIN_VALUE }
+            )
+        }
+        onLoaded(photos)
+    } catch (e: Exception) {
+        onError("读取回收站失败：${e.message ?: "未知错误"}")
+    } finally {
+        onFinish()
+    }
+}
+
+private fun resolveImageCollectionForUri(uri: Uri): Uri {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        return MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+    }
+    val volumeName = uri.pathSegments.firstOrNull().orEmpty()
+    return if (volumeName.isNotBlank()) {
+        MediaStore.Images.Media.getContentUri(volumeName)
+    } else {
+        MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+    }
+}
+
+private fun queryTrashStateById(context: Context, uri: Uri): Boolean? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+    val id = runCatching { ContentUris.parseId(uri) }.getOrNull() ?: return null
+    val collection = resolveImageCollectionForUri(uri)
+    val queryArgs = Bundle().apply {
+        putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE)
+        putString(
+            android.content.ContentResolver.QUERY_ARG_SQL_SELECTION,
+            "${MediaStore.Images.Media._ID}=?"
+        )
+        putStringArray(
+            android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
+            arrayOf(id.toString())
+        )
+        putString(android.content.ContentResolver.QUERY_ARG_SQL_LIMIT, "1")
+    }
+    return runCatching {
+        context.contentResolver.query(
+            collection,
+            arrayOf(MediaStore.MediaColumns.IS_TRASHED),
+            queryArgs,
+            null
+        )?.use { cursor ->
+            val idx = cursor.getColumnIndex(MediaStore.MediaColumns.IS_TRASHED)
+            idx >= 0 && cursor.moveToFirst() && cursor.getInt(idx) == 1
+        }
+    }.getOrNull()
+}
+
 private fun isPhotoInTrash(context: Context, uri: Uri): Boolean {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+    queryTrashStateById(context, uri)?.let { return it }
+
     val queryArgs = Bundle().apply {
         putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE)
     }
@@ -1650,17 +2401,14 @@ private suspend fun verifyPhotosInTrash(
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext uris
     if (uris.isEmpty()) return@withContext emptyList()
 
-    suspend fun unresolvedAfterRetry(target: List<Uri>): List<Uri> {
-        var unresolvedLocal = target
-        repeat(4) { attempt ->
-            unresolvedLocal = unresolvedLocal.filterNot { isPhotoInTrash(context, it) }
-            if (unresolvedLocal.isEmpty()) return unresolvedLocal
-            if (attempt < 3) kotlinx.coroutines.delay(180)
+    var unresolved = uris.distinct()
+    repeat(10) { attempt ->
+        unresolved = unresolved.filterNot { isPhotoInTrash(context, it) }
+        if (unresolved.isEmpty()) return@withContext emptyList()
+        if (attempt < 9) {
+            delay(300)
         }
-        return unresolvedLocal
     }
-
-    var unresolved = unresolvedAfterRetry(uris)
     unresolved
 }
 
@@ -1673,26 +2421,27 @@ private suspend fun markPhotosTrashedWithWriteAccess(
 
     val values = ContentValues().apply {
         put(MediaStore.MediaColumns.IS_TRASHED, 1)
+        put(
+            MediaStore.MediaColumns.DATE_EXPIRES,
+            (System.currentTimeMillis() / 1000L) + 30L * 24L * 60L * 60L
+        )
+    }
+    val valuesWithoutExpires = ContentValues().apply {
+        put(MediaStore.MediaColumns.IS_TRASHED, 1)
     }
 
     uris.forEach { uri ->
-        runCatching {
+        val updated = runCatching {
             context.contentResolver.update(uri, values, null, null)
+        }.getOrDefault(0)
+        if (updated <= 0) {
+            runCatching {
+                context.contentResolver.update(uri, valuesWithoutExpires, null, null)
+            }
         }
     }
 
     verifyPhotosInTrash(context, uris)
-}
-
-private fun refreshGalleryForUris(context: Context, uris: List<Uri>) {
-    uris.forEach { uri ->
-        runCatching { context.contentResolver.notifyChange(uri, null) }
-        runCatching {
-            context.sendBroadcast(
-                Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, uri)
-            )
-        }
-    }
 }
 
 private fun openPhotoExternally(context: Context, uri: Uri) {
